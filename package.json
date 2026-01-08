@@ -1,6 +1,7 @@
 {
   "name": "opencode-anthropic-auth",
-  "version": "0.0.5",
+  "version": "0.0.6",
+  "description": "Anthropic auth for OpenCode with request/response logging capability",
   "main": "./index.mjs",
   "devDependencies": {
     "@opencode-ai/plugin": "^0.4.45"

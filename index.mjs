@@ -1,6 +1,35 @@
 import { generatePKCE } from "@openauthjs/openauth/pkce";
+import { promises as fs } from "fs";
+import { join } from "path";
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+// Logging configuration
+const LOG_DIR = process.env.OPENCODE_AUTH_LOG_DIR ||
+  join(process.env.HOME || process.env.USERPROFILE || ".", ".opencode-anthropic-logs");
+const ENABLE_LOGGING = process.env.OPENCODE_AUTH_LOGGING === "true";
+
+async function ensureLogDirectory() {
+  try {
+    await fs.mkdir(LOG_DIR, { recursive: true });
+  } catch (err) {
+    // Directory already exists or permission error - ignore
+  }
+}
+
+async function logToFile(filename, content) {
+  if (!ENABLE_LOGGING) return;
+
+  await ensureLogDirectory();
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const filepath = join(LOG_DIR, `${filename}-${timestamp}.json`);
+
+  try {
+    await fs.writeFile(filepath, JSON.stringify(content, null, 2), "utf-8");
+  } catch (err) {
+    console.error(`Failed to log to file: ${err.message}`);
+  }
+}
 
 /**
  * @param {"max" | "console"} mode
@@ -95,38 +124,66 @@ export async function AnthropicAuthPlugin({ client }) {
             async fetch(input, init) {
               const auth = await getAuth();
               if (auth.type !== "oauth") return fetch(input, init);
-              if (!auth.access || auth.expires < Date.now()) {
-                const response = await fetch(
-                  "https://console.anthropic.com/v1/oauth/token",
-                  {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                    },
-                    body: JSON.stringify({
-                      grant_type: "refresh_token",
-                      refresh_token: auth.refresh,
-                      client_id: CLIENT_ID,
-                    }),
-                  },
-                );
-                if (!response.ok) {
-                  throw new Error(`Token refresh failed: ${response.status}`);
-                }
-                const json = await response.json();
-                await client.auth.set({
-                  path: {
-                    id: "anthropic",
-                  },
-                  body: {
-                    type: "oauth",
-                    refresh: json.refresh_token,
-                    access: json.access_token,
-                    expires: Date.now() + json.expires_in * 1000,
-                  },
-                });
-                auth.access = json.access_token;
-              }
+               if (!auth.access || auth.expires < Date.now()) {
+                 // Log token refresh request
+                 await logToFile("token-refresh-request", {
+                   url: "https://console.anthropic.com/v1/oauth/token",
+                   method: "POST",
+                   headers: {
+                     "Content-Type": "application/json",
+                   },
+                   body: {
+                     grant_type: "refresh_token",
+                     refresh_token: "[REDACTED]",
+                     client_id: CLIENT_ID,
+                   },
+                 });
+
+                 const response = await fetch(
+                   "https://console.anthropic.com/v1/oauth/token",
+                   {
+                     method: "POST",
+                     headers: {
+                       "Content-Type": "application/json",
+                     },
+                     body: JSON.stringify({
+                       grant_type: "refresh_token",
+                       refresh_token: auth.refresh,
+                       client_id: CLIENT_ID,
+                     }),
+                   },
+                 );
+
+                 if (!response.ok) {
+                   const errorText = await response.text();
+                   await logToFile("token-refresh-error", {
+                     status: response.status,
+                     statusText: response.statusText,
+                     body: errorText,
+                   });
+                   throw new Error(`Token refresh failed: ${response.status}`);
+                 }
+
+                 const json = await response.json();
+                 await logToFile("token-refresh-success", {
+                   access_token: "[REDACTED]",
+                   refresh_token: "[REDACTED]",
+                   expires_in: json.expires_in,
+                 });
+
+                 await client.auth.set({
+                   path: {
+                     id: "anthropic",
+                   },
+                   body: {
+                     type: "oauth",
+                     refresh: json.refresh_token,
+                     access: json.access_token,
+                     expires: Date.now() + json.expires_in * 1000,
+                   },
+                 });
+                 auth.access = json.access_token;
+               }
               // Add oauth-2025-04-20 beta to whatever betas are already present
               const incomingBeta = init.headers?.["anthropic-beta"] || "";
               const incomingBetasList = incomingBeta
@@ -145,16 +202,69 @@ export async function AnthropicAuthPlugin({ client }) {
                 ]),
               ].join(",");
 
-              const headers = {
-                ...init.headers,
-                authorization: `Bearer ${auth.access}`,
-                "anthropic-beta": mergedBetas,
-              };
-              delete headers["x-api-key"];
-              return fetch(input, {
-                ...init,
-                headers,
-              });
+               // Log request before sending
+               const requestData = {
+                 url: input.toString(),
+                 method: init.method || "POST",
+                 headers: {
+                   ...init.headers,
+                   authorization: "[REDACTED]", // Don't log sensitive data
+                   "x-api-key": init.headers?.["x-api-key"] ? "[REDACTED]" : undefined,
+                 },
+                 body: init.body ? (() => {
+                   try {
+                     return JSON.parse(init.body);
+                   } catch {
+                     return "[UNPARSEABLE BODY]";
+                   }
+                 })() : undefined,
+               };
+               await logToFile("request", requestData);
+
+               const headers = {
+                 ...init.headers,
+                 authorization: `Bearer ${auth.access}`,
+                 "anthropic-beta": mergedBetas,
+               };
+               delete headers["x-api-key"];
+
+               // Make the actual request
+               const response = await fetch(input, {
+                 ...init,
+                 headers,
+               });
+
+               // Log response
+               const responseClone = response.clone();
+               let responseData;
+               try {
+                 const responseText = await responseClone.text();
+                 responseData = {
+                   url: input.toString(),
+                   status: response.status,
+                   statusText: response.statusText,
+                   headers: Object.fromEntries(response.headers.entries()),
+                   body: responseText.length > 100000
+                     ? "[TRUNCATED - LARGE BODY]"
+                     : (() => {
+                         try {
+                           return JSON.parse(responseText);
+                         } catch {
+                           return responseText.length > 5000 ? "[UNPARSEABLE LARGE BODY]" : responseText;
+                         }
+                       })(),
+                 };
+               } catch (err) {
+                 responseData = {
+                   url: input.toString(),
+                   status: response.status,
+                   statusText: response.statusText,
+                   error: `Failed to read response: ${err.message}`,
+                 };
+               }
+               await logToFile("response", responseData);
+
+               return response;
             },
           };
         }
